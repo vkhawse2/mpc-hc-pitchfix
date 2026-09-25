@@ -175,6 +175,22 @@ jobs:
           "MPCHC_WINSDK_VER=$sdk" >> $env:GITHUB_ENV
           Write-Host "Using Windows SDK $sdk"
 
+      - name: Patch LAVFilters post-build xcopy to absolute path
+        shell: pwsh
+        run: |
+          # Post-build steps in LAVFilters use bare "xcopy", which fails if
+          # System32 is not on PATH in the MSBuild post-build environment.
+          # Rewrite to an absolute path (idempotent).
+          $files = Get-ChildItem -Path 'src/thirdparty/LAVFilters/src' -Filter '*.vcxproj' -Recurse
+          foreach ($f in $files) {
+            $t = [System.IO.File]::ReadAllText($f.FullName)
+            $t2 = $t -replace '(?<!System32\\)xcopy ', "$env:SystemRoot\System32\xcopy.exe "
+            if ($t2 -ne $t) {
+              [System.IO.File]::WriteAllText($f.FullName, $t2)
+              Write-Host "Patched: $($f.FullName)"
+            }
+          }
+
       - name: Build MPC-HC x64 Release + 7z packages
         shell: cmd
         run: |
