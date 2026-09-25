@@ -1,0 +1,230 @@
+name: Build and Release
+
+# Builds MPC-HC (x64, Release, full incl. LAV Filters) on a Windows runner
+# and publishes the portable 7z packages as a GitHub release.
+#
+# Trigger manually: Actions -> "Build and Release" -> "Run workflow".
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.0-pitchfix)'
+        required: true
+        default: 'v1.0-pitchfix'
+      prerelease:
+        description: 'Mark the GitHub release as a pre-release'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  # Let the MSYS2 shells invoked by build_lavfilters.bat inherit the
+  # Windows PATH (so the MinGW cross compilers are found).
+  MSYS2_PATH_TYPE: inherit
+  MSYSTEM: MINGW64
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      # The LAV/FFmpeg shell scripts are stored with LF endings; the
+      # runner default (autocrlf=true) would convert them to CRLF and
+      # break the MSYS2 build. Keep line endings exactly as committed.
+      - name: Preserve LF line endings for MSYS scripts
+        run: git config --global core.autocrlf input
+
+      - name: Checkout with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          # update_version.bat needs full history + tags for version stamping
+          fetch-depth: 0
+
+      - name: Set up MSYS2 + MinGW toolchains
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          path-type: inherit
+          install: >-
+            make
+            pkg-config
+            diffutils
+            mingw-w64-x86_64-gcc
+            mingw-w64-i686-gcc
+
+      # MSYS2's binutils no longer ships target-prefixed tools in
+      # /mingw64/bin (only unprefixed ones, plus unprefixed copies under
+      # /mingw64/x86_64-w64-mingw32/bin). FFmpeg's configure expects
+      # ${cross_prefix}nm etc. on PATH, so provide the prefixed names.
+      - name: Link prefixed binutils for FFmpeg configure
+        shell: msys2 {0}
+        run: |
+          for t in addr2line ar as c++filt dlltool dllwrap elfedit gprof ld nm objcopy objdump ranlib readelf size strings strip windmc windres; do
+            dst="/mingw64/bin/x86_64-w64-mingw32-${t}.exe"
+            [ -e "$dst" ] && continue
+            for src in "/mingw64/x86_64-w64-mingw32/bin/${t}.exe" "/mingw64/bin/${t}.exe"; do
+              if [ -f "$src" ]; then cp "$src" "$dst"; break; fi
+            done
+          done
+          x86_64-w64-mingw32-nm --version | head -1
+          x86_64-w64-mingw32-ar --version | head -1
+
+      - name: Export MinGW/MSYS paths for build.bat
+        shell: pwsh
+        run: |
+          $msys = '${{ steps.msys2.outputs.msys2-location }}'
+          "MPCHC_MSYS=$msys" >> $env:GITHUB_ENV
+          "MPCHC_MINGW64=$msys\mingw64" >> $env:GITHUB_ENV
+          "MPCHC_MINGW32=$msys\mingw32" >> $env:GITHUB_ENV
+          "$msys\mingw64\bin" >> $env:GITHUB_PATH
+          "$msys\usr\bin" >> $env:GITHUB_PATH
+          Write-Host "MSYS2 at $msys"
+
+      # docs/Compilation.md requires NASM 2.16.03 and YASM 1.3.0.
+      # choco's floating nasm is 3.x and mis-assembles the in-tree .asm
+      # files, so pin nasm. (choco's yasm package tracks 1.2.0; that is
+      # what the package offers.)
+      - name: Install YASM and NASM (in-tree FFmpeg assembly)
+        run: |
+          choco install -y yasm
+          choco install -y nasm --version=2.16.03
+
+      # The nasm installer / choco shims update the machine PATH, which
+      # already-running runner processes do NOT pick up, so MSBuild's
+      # bare `nasm` Exec calls would fail with 9009. Resolve the real
+      # locations and prepend them via GITHUB_PATH instead.
+      - name: Put nasm/yasm on PATH explicitly
+        shell: pwsh
+        run: |
+          $dirs = @()
+          $nasm = Get-Command nasm.exe -ErrorAction SilentlyContinue
+          if ($nasm) { $dirs += (Split-Path $nasm.Source) }
+          else {
+            $candidates = @(
+              'C:\Program Files\NASM\nasm.exe',
+              'C:\Program Files (x86)\NASM\nasm.exe',
+              'C:\ProgramData\chocolatey\bin\nasm.exe'
+            )
+            $lib = Get-ChildItem 'C:\ProgramData\chocolatey\lib\nasm' -Filter 'nasm.exe' -Recurse -ErrorAction SilentlyContinue |
+                   Select-Object -First 1
+            if ($lib) { $candidates += $lib.FullName }
+            foreach ($p in $candidates) {
+              if (Test-Path $p) { $dirs += (Split-Path $p); break }
+            }
+          }
+          $yasm = Get-Command yasm.exe -ErrorAction SilentlyContinue
+          if ($yasm) { $dirs += (Split-Path $yasm.Source) }
+          elseif (Test-Path 'C:\ProgramData\chocolatey\bin\yasm.exe') { $dirs += 'C:\ProgramData\chocolatey\bin' }
+          $dirs = $dirs | Select-Object -Unique
+          if (-not $dirs) { Write-Error 'Could not locate nasm.exe or yasm.exe'; exit 1 }
+          $dirs | ForEach-Object { $_ >> $env:GITHUB_PATH; Write-Host "Added to PATH: $_" }
+
+      # Diagnostic: replicate exactly what build_lavfilters.bat does
+      # (common.bat :SubSetPath) and show which sh/gcc/nm/nasm/yasm/make
+      # the build shell will actually see. Fail fast here instead of
+      # 25 minutes into the build.
+      - name: Probe build shell environment
+        shell: cmd
+        run: |
+          call common.bat :SubSetPath
+          if %ERRORLEVEL% neq 0 exit /b 1
+          echo --- cmd PATH lookups ---
+          where sh 2>nul || echo MISSING: sh
+          where x86_64-w64-mingw32-gcc 2>nul || echo MISSING: x86_64-w64-mingw32-gcc
+          where x86_64-w64-mingw32-nm 2>nul || echo MISSING: x86_64-w64-mingw32-nm
+          where nasm 2>nul || echo MISSING: nasm
+          where yasm 2>nul || echo MISSING: yasm
+          where make 2>nul || echo MISSING: make
+          where pkg-config 2>nul || echo MISSING: pkg-config
+          echo --- inside sh ---
+          sh -c "which -a sh x86_64-w64-mingw32-gcc x86_64-w64-mingw32-nm nasm yasm make pkg-config || true"
+          sh -c "nasm -v || echo NASM_RUN_FAILED"
+          sh -c "x86_64-w64-mingw32-gcc --version | head -1 || echo GCC_RUN_FAILED"
+          sh -c "x86_64-w64-mingw32-nm --version | head -1 || echo NM_RUN_FAILED"
+
+      - name: Install Python polib (translation DLLs)
+        run: python -m pip install --upgrade polib
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Detect newest Windows 10 SDK
+        shell: pwsh
+        run: |
+          $kits = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\Lib' -Directory |
+                  Where-Object { $_.Name -match '^10\.0\.\d+\.0$' } |
+                  Sort-Object Name | Select-Object -ExpandProperty Name
+          if (-not $kits) { Write-Error 'No Windows 10 SDK found on runner'; exit 1 }
+          $sdk = $kits | Select-Object -Last 1
+          "MPCHC_WINSDK_VER=$sdk" >> $env:GITHUB_ENV
+          Write-Host "Using Windows SDK $sdk"
+
+      - name: Build MPC-HC x64 Release + 7z packages
+        shell: cmd
+        run: |
+          set "PATH=%MPCHC_MINGW64%\bin;%PATH%"
+          build.bat Build x64 All Release 7z Silent Nocolors
+
+      - name: Collect packages
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $found = Get-ChildItem -Path . -Filter 'MPC-HC.*.x64.7z'
+          if (-not $found) { Write-Error 'No 7z packages produced by the build'; exit 1 }
+          $found | ForEach-Object {
+            $new = $_.Name -replace '^MPC-HC\.', 'mpc-hc-pitchfix-'
+            Copy-Item $_.FullName "dist\$new"
+            Write-Host "$($_.Name) -> dist\$new"
+          }
+          Get-ChildItem dist
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mpc-hc-pitchfix-x64
+          path: dist/
+
+  release:
+    needs: build
+    runs-on: windows-2022
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: mpc-hc-pitchfix-x64
+          path: dist/
+
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ inputs.tag }}'
+          $files = Get-ChildItem dist -File | ForEach-Object { $_.FullName }
+          if (-not $files) { Write-Error 'No artifacts to release'; exit 1 }
+          $notes = @"
+          MPC-HC with pitch-preserving audio at playback rates above 1x.
+
+          What changed vs upstream clsid2/mpc-hc:
+          - Fresh installs now default to the MPC Audio Renderer, which time-stretches audio
+            (FFmpeg atempo) so speech and music keep their natural pitch at 1.25x/1.5x/2x
+            instead of the chipmunk effect from the plain system renderer.
+            Existing user settings are never touched.
+          - Upstream PR: https://github.com/clsid2/mpc-hc/pull/4241
+
+          Build: x64 Release (full, incl. LAV Filters), portable 7z packages.
+          Extract and run mpc-hc64.exe. Based on commit ${{ github.sha }}.
+
+          Note: unsigned build, so Windows SmartScreen may warn on first launch.
+          "@
+          $createArgs = @('release', 'create', $tag) + $files + @(
+            '--title', "MPC-HC PitchFix $tag",
+            '--notes', $notes
+          )
+          if ('${{ inputs.prerelease }}' -eq 'true') { $createArgs += '--prerelease' }
+          gh @createArgs
