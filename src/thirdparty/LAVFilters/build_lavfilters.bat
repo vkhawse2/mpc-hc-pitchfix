@@ -102,6 +102,11 @@ IF %ERRORLEVEL% NEQ 0 EXIT /B
 IF /I "%ARCH%" == "x86" (SET TOOLSETARCH=x86) ELSE (SET TOOLSETARCH=amd64)
 CALL "%TOOLSET%" -no_logo -arch=%TOOLSETARCH%
 
+REM Make sure the core Windows tools (xcopy etc. used by post-build steps)
+REM stay reachable even if the VS dev prompt mangled PATH
+SET "PATH=%SystemRoot%\System32;%SystemRoot%;%PATH%"
+where xcopy >NUL 2>&1 || ECHO WARNING: xcopy not found on PATH
+
 SET START_TIME=%TIME%
 SET START_DATE=%DATE%
 
