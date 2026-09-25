@@ -262,7 +262,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $found = Get-ChildItem -Path . -Filter 'MPC-HC.*.x64.7z'
+          $found = Get-ChildItem -Path 'bin' -Filter 'MPC-HC.*.x64.7z'
           if (-not $found) { Write-Error 'No 7z packages produced by the build'; exit 1 }
           $found | ForEach-Object {
             $new = $_.Name -replace '^MPC-HC\.', 'mpc-hc-pitchfix-'
