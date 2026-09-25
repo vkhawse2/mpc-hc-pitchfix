@@ -152,7 +152,10 @@ PUSHD src
 REM Build LAVFilters
 IF /I "%ARCH%" == "x86" (SET "ARCHVS=Win32") ELSE (SET "ARCHVS=x64")
 
-MSBuild.exe LAVFilters.sln /nologo /consoleloggerparameters:Verbosity=minimal /nodeReuse:true /m /t:%BUILDTYPE% /property:Configuration=%RELEASETYPE%;Platform=%ARCHVS%
+REM /nodeReuse:false: this nested build must not reuse the outer
+REM mpc-hc.sln build worker nodes, which may carry a different
+REM environment (e.g. PATH without System32 breaks post-build xcopy)
+MSBuild.exe LAVFilters.sln /nologo /consoleloggerparameters:Verbosity=minimal /nodeReuse:false /m /t:%BUILDTYPE% /property:Configuration=%RELEASETYPE%;Platform=%ARCHVS%
 IF %ERRORLEVEL% NEQ 0 (
   CALL "%COMMON%" :SubMsg "ERROR" "'MSBuild.exe LAVFilters.sln /nologo /consoleloggerparameters:Verbosity=minimal /nodeReuse:true /m /t:%BUILDTYPE% /property:Configuration=%RELEASETYPE%;Platform=%ARCHVS%' failed!"
   EXIT /B
