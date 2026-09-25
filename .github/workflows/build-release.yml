@@ -56,6 +56,14 @@ jobs:
             diffutils
             mingw-w64-x86_64-gcc
             mingw-w64-i686-gcc
+            mingw-w64-x86_64-bzip2
+            mingw-w64-x86_64-dav1d
+            mingw-w64-x86_64-gmp
+            mingw-w64-x86_64-gnutls
+            mingw-w64-x86_64-libxml2
+            mingw-w64-x86_64-opencore-amr
+            mingw-w64-x86_64-speex
+            mingw-w64-x86_64-zlib
 
       # MSYS2's binutils no longer ships target-prefixed tools in
       # /mingw64/bin (only unprefixed ones, plus unprefixed copies under
@@ -83,6 +91,9 @@ jobs:
           "MPCHC_MINGW32=$msys\mingw32" >> $env:GITHUB_ENV
           "$msys\mingw64\bin" >> $env:GITHUB_PATH
           "$msys\usr\bin" >> $env:GITHUB_PATH
+          # build_ffmpeg.sh appends to PKG_CONFIG_PATH (never overwrites), so
+          # pre-seed it with the MSYS2 pkgconfig dir for dav1d/gnutls/etc.
+          "PKG_CONFIG_PATH=/mingw64/lib/pkgconfig" >> $env:GITHUB_ENV
           Write-Host "MSYS2 at $msys"
 
       # docs/Compilation.md requires NASM 2.16.03 and YASM 1.3.0.
@@ -169,6 +180,67 @@ jobs:
         run: |
           set "PATH=%MPCHC_MINGW64%\bin;%PATH%"
           build.bat Build x64 All Release 7z Silent Nocolors
+
+      # FFmpeg links third-party libs (dav1d, gnutls, ...) from MSYS2 as
+      # shared DLLs. The official builds link them statically; we bundle the
+      # DLLs instead so the portable package runs on machines without MSYS2.
+      - name: Collect MinGW dependency DLLs
+        shell: msys2 {0}
+        run: |
+          ws="$(cygpath "$GITHUB_WORKSPACE")"
+          lav="$ws/bin/mpc-hc_x64/LAVFilters64"
+          out="$(cygpath "$RUNNER_TEMP")/depdlls"
+          mkdir -p "$out"
+          fail=/tmp/depcheck_fail; : > "$fail"
+          for dll in "$lav"/*.dll; do
+            ldd "$dll" 2>/dev/null | while IFS= read -r line; do
+              case "$line" in
+                *'=>'*'/mingw64/bin/'*)
+                  dep="${line##*=> }"; dep="${dep%% *}"
+                  cp -u "$dep" "$out"/ ;;
+                *'not found'*)
+                  name="${line%% *}"
+                  [ -f "$lav/$name" ] || echo "$name <- $(basename "$dll")" >> "$fail" ;;
+              esac
+            done
+          done
+          if [ -s "$fail" ]; then echo "Unresolved dependencies:"; cat "$fail"; exit 1; fi
+          echo "Collected $(ls "$out" | wc -l) DLLs:"; ls "$out"
+
+      # The loader always searches the application directory first, so the
+      # dependency DLLs go next to mpc-hc64.exe. Repack the 7z archives with
+      # them included (same layout and compression flags as build.bat).
+      - name: Inject dependency DLLs into 7z packages
+        shell: pwsh
+        run: |
+          $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
+          if (-not (Test-Path $sevenZip)) { Write-Error '7-Zip not found'; exit 1 }
+          $depDir = Join-Path $env:RUNNER_TEMP 'depdlls'
+          $dlls = @(Get-ChildItem -Path $depDir -Filter '*.dll')
+          if ($dlls.Count -eq 0) { Write-Error 'No dependency DLLs collected'; exit 1 }
+          Push-Location 'bin'
+          try {
+            foreach ($archive in @(Get-ChildItem -Filter 'MPC-HC.*.x64.7z')) {
+              $tmp = Join-Path $env:RUNNER_TEMP ("repack_" + $archive.BaseName)
+              if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
+              & $sevenZip x $archive.FullName "-o$tmp" -y | Out-Null
+              if ($LASTEXITCODE -ne 0) { Write-Error "extract failed: $($archive.Name)"; exit 1 }
+              foreach ($root in @(Get-ChildItem -Path $tmp -Directory)) {
+                if (Test-Path (Join-Path $root.FullName 'LAVFilters64')) {
+                  Copy-Item (Join-Path $depDir '*.dll') $root.FullName
+                  Write-Host "Injected $($dlls.Count) DLLs into $($root.Name)"
+                }
+              }
+              Remove-Item $archive.FullName -Force
+              Push-Location $tmp
+              try {
+                $dirArgs = @(Get-ChildItem -Directory | ForEach-Object { $_.Name })
+                & $sevenZip a -t7z $archive.FullName @dirArgs -m0=LZMA2 "-mmt=$env:NUMBER_OF_PROCESSORS" -mx9 -ms=on | Out-Null
+                if ($LASTEXITCODE -ne 0) { Write-Error "repack failed: $($archive.Name)"; exit 1 }
+              } finally { Pop-Location }
+              Write-Host "Repacked $($archive.Name)"
+            }
+          } finally { Pop-Location }
 
       - name: Collect packages
         shell: pwsh
