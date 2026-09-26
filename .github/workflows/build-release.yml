@@ -291,6 +291,7 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: vkhawse2/mpc-hc-pitchfix
         run: |
           $tag = '${{ inputs.tag }}'
           $files = Get-ChildItem dist -File | ForEach-Object { $_.FullName }
