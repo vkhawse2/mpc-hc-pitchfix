@@ -191,11 +191,11 @@ jobs:
             }
           }
 
-      - name: Build MPC-HC x64 Release + 7z packages
+      - name: Build MPC-HC x64 Release (compile only)
         shell: cmd
         run: |
           set "PATH=%MPCHC_MINGW64%\bin;%PATH%"
-          build.bat Build x64 All Release 7z Silent Nocolors
+          build.bat Build x64 All Release Silent Nocolors
 
       # FFmpeg links third-party libs (dav1d, gnutls, ...) from MSYS2 as
       # shared DLLs. The official builds link them statically; we bundle the
@@ -222,48 +222,22 @@ jobs:
           done
           if [ -s "$fail" ]; then echo "Unresolved dependencies:"; cat "$fail"; exit 1; fi
           echo "Collected $(ls "$out" | wc -l) DLLs:"; ls "$out"
+          # Copy into LAVFilters64/ so the installer (.iss) and 7z packages pick them up
+          cp "$out"/*.dll "$lav"/
+          echo "Copied to LAVFilters64/"
 
-      # The loader always searches the application directory first, so the
-      # dependency DLLs go next to mpc-hc64.exe. Repack the 7z archives with
-      # them included (same layout and compression flags as build.bat).
-      - name: Inject dependency DLLs into 7z packages
-        shell: pwsh
+      - name: Build installer + 7z packages
+        shell: cmd
         run: |
-          $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
-          if (-not (Test-Path $sevenZip)) { Write-Error '7-Zip not found'; exit 1 }
-          $depDir = Join-Path $env:RUNNER_TEMP 'depdlls'
-          $dlls = @(Get-ChildItem -Path $depDir -Filter '*.dll')
-          if ($dlls.Count -eq 0) { Write-Error 'No dependency DLLs collected'; exit 1 }
-          Push-Location 'bin'
-          try {
-            foreach ($archive in @(Get-ChildItem -Filter 'MPC-HC.*.x64.7z')) {
-              $tmp = Join-Path $env:RUNNER_TEMP ("repack_" + $archive.BaseName)
-              if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
-              & $sevenZip x $archive.FullName "-o$tmp" -y | Out-Null
-              if ($LASTEXITCODE -ne 0) { Write-Error "extract failed: $($archive.Name)"; exit 1 }
-              foreach ($root in @(Get-ChildItem -Path $tmp -Directory)) {
-                if (Test-Path (Join-Path $root.FullName 'LAVFilters64')) {
-                  Copy-Item (Join-Path $depDir '*.dll') $root.FullName
-                  Write-Host "Injected $($dlls.Count) DLLs into $($root.Name)"
-                }
-              }
-              Remove-Item $archive.FullName -Force
-              Push-Location $tmp
-              try {
-                $dirArgs = @(Get-ChildItem -Directory | ForEach-Object { $_.Name })
-                & $sevenZip a -t7z $archive.FullName @dirArgs -m0=LZMA2 "-mmt=$env:NUMBER_OF_PROCESSORS" -mx9 -ms=on | Out-Null
-                if ($LASTEXITCODE -ne 0) { Write-Error "repack failed: $($archive.Name)"; exit 1 }
-              } finally { Pop-Location }
-              Write-Host "Repacked $($archive.Name)"
-            }
-          } finally { Pop-Location }
+          set "PATH=%MPCHC_MINGW64%\bin;%PATH%"
+          build.bat Build x64 All Release Packages Silent Nocolors
 
       - name: Collect packages
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $found = Get-ChildItem -Path 'bin' -Filter 'MPC-HC.*.x64.7z'
-          if (-not $found) { Write-Error 'No 7z packages produced by the build'; exit 1 }
+          $found = @(Get-ChildItem -Path 'bin' -Filter 'MPC-HC.*.x64.7z') + @(Get-ChildItem -Path 'bin' -Filter 'MPC-HC.*.x64.exe')
+          if (-not $found) { Write-Error 'No packages produced by the build'; exit 1 }
           $found | ForEach-Object {
             $new = $_.Name -replace '^MPC-HC\.', 'mpc-hc-pitchfix-'
             Copy-Item $_.FullName "dist\$new"
