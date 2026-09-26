@@ -226,6 +226,12 @@ jobs:
           cp "$out"/*.dll "$lav"/
           echo "Copied to LAVFilters64/"
 
+      - name: Install Inno Setup 6 (installer .exe)
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          if ($LASTEXITCODE -ne 0) { Write-Error 'choco innosetup failed'; exit 1 }
+
       - name: Build installer + 7z packages
         shell: cmd
         run: |
